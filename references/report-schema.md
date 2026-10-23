@@ -66,7 +66,7 @@ A package referenced by an application project and a test project has two locati
 
 ## Runtime (NuGet)
 
-`runtime` is the .NET runtime checked against Microsoft's [releases-index.json](https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json) and each line's `releases.json`. It is separate from `findings` and does not change `vulnerablePackageVersions`. The npm skill has a `runtime` for Node.js with the same intent. The fields differ because the sources differ.
+`runtime` is the .NET runtime checked against Microsoft's [releases-index.json](https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json) and each line's `releases.json`. It is separate from `findings` and does not change `vulnerablePackageVersions`. The npm and PyPI skills have a `runtime` for Node.js and CPython with the same intent. The fields differ because the sources differ.
 
 | Field | Meaning |
 | --- | --- |
