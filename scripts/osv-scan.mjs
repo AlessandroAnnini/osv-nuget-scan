@@ -2,6 +2,7 @@
 // Match NuGet package versions against https://api.osv.dev.
 // Stdout is one JSON document. Progress goes to stderr. No dependencies.
 
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11,6 +12,14 @@ const API = "https://api.osv.dev/v1";
 const BATCH = 800;
 const RANK = { CRITICAL: 4, HIGH: 3, MEDIUM: 2, LOW: 1, UNKNOWN: 0 };
 const SKIP_DIRS = new Set([".git", "bin", "obj", "node_modules"]);
+const DOTNET_INDEX =
+  "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json";
+// Shared framework name in `dotnet --list-runtimes` -> its version field in releases.json.
+const RUNTIME_COMPONENTS = {
+  "Microsoft.NETCore.App": "runtime",
+  "Microsoft.AspNetCore.App": "aspnetcore-runtime",
+  "Microsoft.WindowsDesktop.App": "windowsdesktop",
+};
 const TEST_PACKAGES = new Set([
   "microsoft.net.test.sdk",
   "mstest.testframework",
@@ -725,6 +734,13 @@ export function scanTree(rootInput) {
     }
   }
 
+  const targets = [];
+  for (const rel of found.projects.sort()) {
+    const xml = projectXml.get(rel);
+    if (xml === undefined) continue;
+    for (const target of targetFrameworks(xml, contextFor(rel).buildXml)) targets.push({ project: rel, ...target });
+  }
+
   const byKey = new Map();
   for (const item of items) {
     for (const row of item.installs.values()) remember(byKey, row, item);
@@ -753,7 +769,130 @@ export function scanTree(rootInput) {
     packages,
     warnings,
     lockfiles: [...new Set(items.filter((item) => item.installs.size).map((item) => item.rel))].sort(),
+    targets,
   };
+}
+
+// TargetFramework and TargetFrameworks, from the project or Directory.Build.props.
+// channel is the .NET release line, or null with a reason when it is not a .NET runtime.
+export function targetFrameworks(xml, buildXml = "") {
+  const properties = readProperties(`${buildXml}\n${xml}`);
+  const raw = [properties.get("targetframeworks"), properties.get("targetframework")].find(
+    (value) => value !== undefined && value !== "",
+  );
+  if (raw === undefined) return [];
+  const out = [];
+  for (const part of resolveText(raw, properties).split(";")) {
+    const tfm = part.trim();
+    if (!tfm) continue;
+    const modern = tfm.match(/^net(\d+)\.(\d+)(?:-[A-Za-z0-9.]+)?$/i);
+    const core = tfm.match(/^netcoreapp(\d+)\.(\d+)$/i);
+    if (modern && Number(modern[1]) >= 5) out.push({ targetFramework: tfm, channel: `${modern[1]}.${modern[2]}` });
+    else if (core) out.push({ targetFramework: tfm, channel: `${core[1]}.${core[2]}` });
+    else if (/^net\d{2,3}$/i.test(tfm)) {
+      out.push({ targetFramework: tfm, channel: null, reason: ".NET Framework is serviced through Windows Update and is not covered" });
+    } else if (/^netstandard/i.test(tfm)) {
+      out.push({ targetFramework: tfm, channel: null, reason: ".NET Standard is not a runtime" });
+    } else {
+      out.push({ targetFramework: tfm, channel: null, reason: "not a recognized .NET target framework" });
+    }
+  }
+  return out;
+}
+
+// Lines of `dotnet --list-runtimes`, such as "Microsoft.NETCore.App 8.0.32 [/usr/lib/dotnet/...]".
+export function parseListRuntimes(text) {
+  const out = [];
+  for (const line of String(text).split(/\r?\n/)) {
+    const match = line.trim().match(/^(Microsoft\.[A-Za-z.]+)\s+(\S+)\s+\[/);
+    if (match && RUNTIME_COMPONENTS[match[1]]) out.push({ component: match[1], version: match[2] });
+  }
+  return out;
+}
+
+function installedRuntimes() {
+  try {
+    const text = execFileSync("dotnet", ["--list-runtimes"], {
+      encoding: "utf8",
+      timeout: 15000,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, DOTNET_CLI_TELEMETRY_OPTOUT: "1", DOTNET_NOLOGO: "1" },
+    });
+    return parseListRuntimes(text);
+  } catch {
+    return null;
+  }
+}
+
+function channelOf(version) {
+  const parsed = parseNuGet(version);
+  return parsed ? `${parsed.major}.${parsed.minor}` : null;
+}
+
+// Support phase and end of life for one release line from releases-index.json.
+export function channelStatus(channel, index, now = new Date()) {
+  const entry = (index?.["releases-index"] ?? []).find((item) => item["channel-version"] === channel);
+  if (!entry) {
+    return { releaseLine: channel, supportPhase: null, releaseType: null, endOfLife: null, endOfLifeDate: null };
+  }
+  const end = entry["eol-date"] || null;
+  return {
+    releaseLine: channel,
+    supportPhase: entry["support-phase"] ?? null,
+    releaseType: entry["release-type"] ?? null,
+    endOfLife: entry["support-phase"] === "eol" || (end ? new Date(`${end}T23:59:59Z`) < now : false),
+    endOfLifeDate: end,
+  };
+}
+
+export function latestLts(index) {
+  const lines = (index?.["releases-index"] ?? [])
+    .filter((item) => item["release-type"] === "lts" && item["support-phase"] === "active")
+    .map((item) => item["channel-version"])
+    .sort((a, b) => compareVersions(a, b) ?? 0);
+  return lines.at(-1) ?? null;
+}
+
+// One installed shared framework against its line's releases.json. cve-list belongs to a whole
+// release, so the CVEs are the ones fixed in releases newer than this version, not per component.
+export function checkDotnetRuntime(component, version, index, releases, now = new Date()) {
+  const field = RUNTIME_COMPONENTS[component];
+  const status = channelStatus(channelOf(version), index, now);
+  const result = { component, version, ...status };
+  if (!field || !releases) {
+    return { ...result, vulnerable: null, upgradeTo: null, missedSecurityReleases: [], cves: [] };
+  }
+  let latest = null;
+  const missed = [];
+  for (const release of releases.releases ?? []) {
+    const shipped = release?.[field]?.version;
+    if (typeof shipped !== "string" || compareVersions(shipped, version) === null) continue;
+    if (latest === null || compareVersions(shipped, latest) > 0) latest = shipped;
+    if (release.security === true && compareVersions(shipped, version) > 0) missed.push({ release, shipped });
+  }
+  missed.sort((a, b) => compareVersions(a.shipped, b.shipped));
+  const cves = [...new Set(missed.flatMap(({ release }) => (release["cve-list"] ?? []).map((cve) => cve["cve-id"])))]
+    .filter(Boolean)
+    .sort();
+  return {
+    ...result,
+    vulnerable: missed.length > 0,
+    upgradeTo: missed.length ? latest : null,
+    missedSecurityReleases: [...new Set(missed.map(({ shipped }) => shipped))],
+    cves,
+  };
+}
+
+// The highest patch of each framework and line is the one apps roll forward to. Older
+// side-by-side patches are listed but marked active: false.
+export function markActive(runtimes) {
+  const best = new Map();
+  for (const item of runtimes) {
+    const key = `${item.component}|${channelOf(item.version)}`;
+    const current = best.get(key);
+    if (!current || compareVersions(item.version, current.version) > 0) best.set(key, item);
+  }
+  return runtimes.map((item) => ({ ...item, active: best.get(`${item.component}|${channelOf(item.version)}`) === item }));
 }
 
 export function lowestFix(versions, installed) {
@@ -937,8 +1076,72 @@ async function requestJson(url, options) {
   throw lastErr;
 }
 
+export function parseArgs(argv) {
+  const args = { root: null, dotnetVersion: null };
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === "--dotnet-version") args.dotnetVersion = argv[++i] ?? "";
+    else if (arg.startsWith("--dotnet-version=")) args.dotnetVersion = arg.slice(17);
+    else if (args.root === null) args.root = arg;
+  }
+  return args;
+}
+
+async function scanRuntime(dotnetVersion, targets) {
+  const source = dotnetVersion === null ? "process" : "flag";
+  const runtime = { name: "dotnet", source };
+  let runtimes;
+  if (source === "flag") {
+    if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(dotnetVersion)) {
+      return { runtime: { ...runtime, error: "not an exact x.y.z version" }, warnings: [] };
+    }
+    runtimes = [{ component: "Microsoft.NETCore.App", version: dotnetVersion }];
+  } else {
+    runtimes = installedRuntimes();
+    if (runtimes === null) {
+      runtime.note = "dotnet was not found on PATH, so no installed runtime was checked";
+      runtimes = [];
+    }
+  }
+  console.error(`dotnet runtimes: ${runtimes.length} (${source}), target frameworks: ${targets.length}`);
+  try {
+    const index = await requestJson(DOTNET_INDEX);
+    const channels = new Set([
+      ...runtimes.map((item) => channelOf(item.version)),
+      ...targets.map((item) => item.channel),
+    ].filter(Boolean));
+    const releases = new Map();
+    for (const channel of channels) {
+      const entry = index["releases-index"]?.find((item) => item["channel-version"] === channel);
+      if (entry?.["releases.json"]) releases.set(channel, await requestJson(entry["releases.json"]));
+    }
+    const installed = markActive(runtimes).map((item) => ({
+      ...checkDotnetRuntime(item.component, item.version, index, releases.get(channelOf(item.version))),
+      active: item.active,
+    }));
+    const checkedTargets = targets.map((item) =>
+      item.channel ? { ...item, ...channelStatus(item.channel, index) } : item,
+    );
+    const active = installed.filter((item) => item.active);
+    return {
+      runtime: {
+        ...runtime,
+        latestLts: latestLts(index),
+        vulnerable: active.length ? active.some((item) => item.vulnerable) : null,
+        installed,
+        targets: checkedTargets,
+      },
+      warnings: [],
+    };
+  } catch (err) {
+    const error = `dotnet runtime not checked: ${err.message || err}`;
+    return { runtime: { ...runtime, error }, warnings: [error] };
+  }
+}
+
 async function main() {
-  const root = path.resolve(process.argv[2] || process.cwd());
+  const args = parseArgs(process.argv.slice(2));
+  const root = path.resolve(args.root || process.cwd());
   const scanned = scanTree(root);
   if (scanned.error) fail(scanned.error);
 
@@ -1033,6 +1236,8 @@ async function main() {
   });
 
   console.error(`vulnerable versions: ${findings.length}`);
+  const runtime = await scanRuntime(args.dotnetVersion, scanned.targets);
+  scanned.warnings.push(...runtime.warnings);
   const report = {
     ecosystem: ECOSYSTEM,
     scannedAt: new Date().toISOString(),
@@ -1041,6 +1246,7 @@ async function main() {
     packageVersions: packages.length,
     vulnerablePackageVersions: findings.length,
     findings,
+    runtime: runtime.runtime,
   };
   if (scanned.warnings.length) report.warnings = scanned.warnings;
   process.stdout.write(JSON.stringify(report, null, 2) + "\n");

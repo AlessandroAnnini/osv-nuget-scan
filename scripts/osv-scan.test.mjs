@@ -4,6 +4,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  channelStatus,
+  checkDotnetRuntime,
   collectAssetsData,
   collectLockfileData,
   collectProjectRefs,
@@ -19,6 +21,11 @@ import {
   summarizeGroup,
   upgradeTo,
   walkFiles,
+  latestLts,
+  markActive,
+  parseArgs,
+  parseListRuntimes,
+  targetFrameworks,
 } from "./osv-scan.mjs";
 
 const HIGH_VECTOR = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:H/A:N";
@@ -446,4 +453,100 @@ test("project.assets.json wins over a direct pin, and a lockfile wins over both"
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+const DOTNET_INDEX = {
+  "releases-index": [
+    { "channel-version": "10.0", "support-phase": "active", "release-type": "lts", "eol-date": "2028-11-14" },
+    { "channel-version": "9.0", "support-phase": "maintenance", "release-type": "sts", "eol-date": "2026-11-10" },
+    { "channel-version": "8.0", "support-phase": "maintenance", "release-type": "lts", "eol-date": "2026-11-10" },
+    { "channel-version": "6.0", "support-phase": "eol", "release-type": "lts", "eol-date": "2024-11-12" },
+  ],
+};
+const DOTNET_8 = {
+  releases: [
+    {
+      "release-version": "8.0.3",
+      security: true,
+      "cve-list": [{ "cve-id": "CVE-2026-3" }, { "cve-id": "CVE-2026-1" }],
+      runtime: { version: "8.0.3" },
+      "aspnetcore-runtime": { version: "8.0.4" },
+    },
+    { "release-version": "8.0.2", security: false, runtime: { version: "8.0.2" }, "aspnetcore-runtime": { version: "8.0.2" } },
+    {
+      "release-version": "8.0.1",
+      security: true,
+      "cve-list": [{ "cve-id": "CVE-2026-1" }],
+      runtime: { version: "8.0.1" },
+      "aspnetcore-runtime": { version: "8.0.1" },
+    },
+  ],
+};
+const OCT_2026 = new Date("2026-10-23T00:00:00Z");
+
+test("target frameworks: plural, platform suffix, props value, Framework, and Standard", () => {
+  assert.deepEqual(
+    targetFrameworks("<Project><PropertyGroup><TargetFrameworks>net8.0;net10.0-windows;netstandard2.0;net48</TargetFrameworks></PropertyGroup></Project>").map(
+      (item) => [item.targetFramework, item.channel],
+    ),
+    [["net8.0", "8.0"], ["net10.0-windows", "10.0"], ["netstandard2.0", null], ["net48", null]],
+  );
+  const props = "<Project><PropertyGroup><Tfm>netcoreapp3.1</Tfm><TargetFramework>$(Tfm)</TargetFramework></PropertyGroup></Project>";
+  assert.deepEqual(targetFrameworks("<Project />", props), [{ targetFramework: "netcoreapp3.1", channel: "3.1" }]);
+  assert.deepEqual(targetFrameworks("<Project />"), []);
+});
+
+test("dotnet --list-runtimes lines are parsed and other frameworks ignored", () => {
+  const text = [
+    "Microsoft.AspNetCore.App 8.0.32 [/usr/lib/dotnet/shared/Microsoft.AspNetCore.App]",
+    "Microsoft.NETCore.App 8.0.32 [/usr/lib/dotnet/shared/Microsoft.NETCore.App]",
+    "Microsoft.Other.App 1.0.0 [/x]",
+    "",
+  ].join("\n");
+  assert.deepEqual(parseListRuntimes(text), [
+    { component: "Microsoft.AspNetCore.App", version: "8.0.32" },
+    { component: "Microsoft.NETCore.App", version: "8.0.32" },
+  ]);
+});
+
+test("a runtime behind security releases collects their CVEs and the latest component version", () => {
+  const old = checkDotnetRuntime("Microsoft.NETCore.App", "8.0.0", DOTNET_INDEX, DOTNET_8, OCT_2026);
+  assert.equal(old.vulnerable, true);
+  assert.deepEqual(old.missedSecurityReleases, ["8.0.1", "8.0.3"]);
+  assert.deepEqual(old.cves, ["CVE-2026-1", "CVE-2026-3"]);
+  assert.equal(old.upgradeTo, "8.0.3");
+  assert.equal(old.supportPhase, "maintenance");
+  assert.equal(old.endOfLife, false);
+
+  const asp = checkDotnetRuntime("Microsoft.AspNetCore.App", "8.0.3", DOTNET_INDEX, DOTNET_8, OCT_2026);
+  assert.deepEqual(asp.missedSecurityReleases, ["8.0.4"], "ASP.NET Core is compared on its own version");
+  assert.equal(asp.upgradeTo, "8.0.4");
+
+  const current = checkDotnetRuntime("Microsoft.NETCore.App", "8.0.3", DOTNET_INDEX, DOTNET_8, OCT_2026);
+  assert.equal(current.vulnerable, false);
+  assert.equal(current.upgradeTo, null);
+});
+
+test("end of life comes from the phase or a past date, and latest LTS from the index", () => {
+  assert.equal(channelStatus("6.0", DOTNET_INDEX, OCT_2026).endOfLife, true);
+  assert.equal(channelStatus("8.0", DOTNET_INDEX, OCT_2026).endOfLife, false);
+  assert.equal(channelStatus("8.0", DOTNET_INDEX, new Date("2026-11-11T00:00:00Z")).endOfLife, true);
+  assert.equal(channelStatus("4.0", DOTNET_INDEX, OCT_2026).endOfLife, null);
+  assert.equal(latestLts(DOTNET_INDEX), "10.0");
+});
+
+test("only the highest patch of each framework and line is active", () => {
+  const marked = markActive([
+    { component: "Microsoft.NETCore.App", version: "8.0.1" },
+    { component: "Microsoft.NETCore.App", version: "8.0.3" },
+    { component: "Microsoft.NETCore.App", version: "9.0.0" },
+    { component: "Microsoft.AspNetCore.App", version: "8.0.1" },
+  ]);
+  assert.deepEqual(marked.map((item) => item.active), [false, true, true, true]);
+});
+
+test("--dotnet-version is read in either form and the root stays positional", () => {
+  assert.deepEqual(parseArgs(["/p", "--dotnet-version", "8.0.1"]), { root: "/p", dotnetVersion: "8.0.1" });
+  assert.deepEqual(parseArgs(["--dotnet-version=9.0.0", "/p"]), { root: "/p", dotnetVersion: "9.0.0" });
+  assert.deepEqual(parseArgs([]), { root: null, dotnetVersion: null });
 });
